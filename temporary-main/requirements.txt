@@ -19,6 +19,7 @@ ultralytics
 requests
 aiohttp
 httpx
+groq
 
 # Frontend integration
 streamlit
