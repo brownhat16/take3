@@ -1,0 +1,47 @@
+# FastAPI and web server dependencies
+fastapi
+uvicorn
+python-multipart
+pydantic
+starlette
+
+# Image processing libraries
+opencv-python-headless
+Pillow
+numpy==1.26.4
+
+# Machine learning and AI
+torch==2.1.2
+transformers
+ultralytics
+
+# API and networking
+requests
+aiohttp
+httpx
+
+# Frontend integration
+streamlit
+streamlit-extras
+streamlit-image-comparison
+
+# Data handling and processing
+pandas
+matplotlib
+plotly
+
+# Utility libraries
+python-dotenv
+typing-extensions
+tqdm
+joblib
+cachetools
+
+# Security and authentication
+python-jose
+passlib
+bcrypt
+
+# Development tools
+pytest
+
