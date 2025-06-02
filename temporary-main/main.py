@@ -1,5 +1,3 @@
-# main.py
-
 import base64
 import json
 import os
@@ -21,14 +19,13 @@ import logging
 from dotenv import load_dotenv
 import ssl
 import certifi
-from groq import Groq
+import together
 from fastapi import Depends, HTTPException, status
 from fastapi.security import APIKeyHeader
 
 ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
 
 load_dotenv()
-
 
 # ------------------ MODEL & ANALYZER ------------------
 
@@ -118,13 +115,12 @@ class ObjectDetectionModule:
             detr_detections = self.detect_objects_detr(image_path)
             return yolo_detections + detr_detections
 
-
 class EnhancedFinancialImageAnalyzer:
     def __init__(self,
-                 groq_api_key: str,
-                 vision_llm_model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
-                 reasoning_llm_model: str = "qwen-qwq-32b",
-                 text_llm_model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
+                 together_api_key: str,
+                 vision_llm_model: str = "Qwen/Qwen2.5-VL-72B-Instruct",
+                 reasoning_llm_model: str = "Qwen/Qwen3-235B-A22B-fp8-tput",
+                 text_llm_model: str = "meta-llama/Meta-Llama-Guard-3-8B",
                  yolo_model_path: str = "yolov8n.pt",
                  detr_model_name: str = "facebook/detr-resnet-50",
                  use_deyo: bool = False,
@@ -132,7 +128,8 @@ class EnhancedFinancialImageAnalyzer:
                  cache_dir: str = "cache",
                  parallel_execution: bool = True,
                  max_workers: int = 3):
-        self.groq_api_key = groq_api_key
+        self.together_api_key = together_api_key
+        together.api_key = together_api_key
         self.vision_llm_model = vision_llm_model
         self.reasoning_llm_model = reasoning_llm_model
         self.text_llm_model = text_llm_model
@@ -140,9 +137,6 @@ class EnhancedFinancialImageAnalyzer:
         self.cache_dir = cache_dir
         self.parallel_execution = parallel_execution
         self.max_workers = max_workers
-
-        # Initialize Groq client
-        self.groq_client = Groq(api_key=self.groq_api_key)
 
         if self.use_cache and not os.path.exists(self.cache_dir):
             os.makedirs(self.cache_dir)
@@ -176,7 +170,7 @@ class EnhancedFinancialImageAnalyzer:
             return base64.b64encode(image_file.read()).decode('utf-8')
 
     def _get_cache_path(self, image_path: str) -> str:
-        image_name = os.path.basename(image_path)
+        image_name = os.path.bastename(image_path) if hasattr(os.path, 'bastename') else os.path.basename(image_path)
         cache_name = f"{os.path.splitext(image_name)[0]}_analysis.json"
         return os.path.join(self.cache_dir, cache_name)
 
@@ -198,38 +192,48 @@ class EnhancedFinancialImageAnalyzer:
         except Exception:
             pass
 
-    def _call_groq_api(self, model: str, messages: List[Dict[str, Any]],
-                       max_tokens: int = 1024, temperature: float = 0.2, top_p: float = 1.0) -> Dict[str, Any]:
+    def _call_together_api(self, model: str, prompt: List[Dict[str, Any]],
+                          max_tokens: int = 1024, temperature: float = 0.2, top_p: float = 1.0) -> Dict[str, Any]:
         max_retries = 3
         retry_delay = 2
 
         for attempt in range(max_retries):
             try:
-                completion = self.groq_client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    max_completion_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stream=False
-                )
+                # Convert messages to prompt string
+                prompt_text = ""
+                for msg in prompt:
+                    if msg["role"] == "system":
+                        prompt_text += f"SYSTEM: {msg['content']}\n\n"
+                    else:
+                        if isinstance(msg["content"], list):
+                            for part in msg["content"]:
+                                if part["type"] == "text":
+                                    prompt_text += f"USER: {part['text']}\n\n"
+                                elif part["type"] == "image_url":
+                                    prompt_text += f"[Image: {part['image_url']['url'][:50]}...]\n\n"
+                        else:
+                            prompt_text += f"USER: {msg['content']}\n\n"
 
+                response = together.Complete.create(
+                    prompt=prompt_text,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p
+                )
                 return {
                     "choices": [{
                         "message": {
-                            "content": completion.choices[0].message.content
+                            "content": response["output"]["choices"][0]["text"]
                         }
                     }]
                 }
-
             except Exception as e:
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
                     retry_delay = min(retry_delay * 2, 60)
                 else:
-                    return {"error": f"Groq API error: {str(e)}"}
-
-        return {"error": "Max retries exceeded"}
+                    return {"error": f"Together API error: {str(e)}"}
 
     def _extract_json_from_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         if "error" in response:
@@ -448,9 +452,7 @@ Format your response as a JSON with these keys:
 - "verified_detections": List of objects you confirm are present
 - "corrected_detections": List of objects with corrected classifications
 - "missed_objects": List of objects that were missed
-- "confidence": Your overall confidence in this assessment
-
-"""
+- "confidence": Your overall confidence in this assessment"""
             },
             {
                 "role": "user",
@@ -465,7 +467,7 @@ Format your response as a JSON with these keys:
         return [
             {
                 "role": "system",
-                "content": """Analyze this financial marketing image and provide ONLY the following character information:
+                "content": """Analyize this financial marketing image and provide ONLY the following character information:
 
 1. Emotion (if faces shown): Categorize as Happy, Excited, Neutral, Angry, or None
 2. Gender shown (if people shown): Categorize as Male, Female, Both, or Not Applicable
@@ -570,7 +572,7 @@ Format your response as a structured JSON."""
 
         image_base64 = self._encode_image(image_path)
         verification_prompt = self._object_verification_prompt(image_base64, detections)
-        verification_response = self._call_groq_api(
+        verification_response = self._call_together_api(
             self.vision_llm_model,
             verification_prompt,
             temperature=1,
@@ -631,7 +633,7 @@ Format your response as a structured JSON."""
 
     def _run_llm_object_detection(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._object_detection_prompt(image_base64)
-        response = self._call_groq_api(
+        response = self._call_together_api(
             self.vision_llm_model,
             prompt,
             temperature=1,
@@ -642,7 +644,7 @@ Format your response as a structured JSON."""
 
     def _run_color_palette_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._color_palette_prompt(image_base64)
-        response = self._call_groq_api(
+        response = self._call_together_api(
             self.vision_llm_model,
             prompt,
             temperature=1,
@@ -653,7 +655,7 @@ Format your response as a structured JSON."""
 
     def _run_layout_composition_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._layout_composition_prompt(image_base64)
-        response = self._call_groq_api(
+        response = self._call_together_api(
             self.vision_llm_model,
             prompt,
             temperature=1,
@@ -664,7 +666,7 @@ Format your response as a structured JSON."""
 
     def _run_image_type_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._image_type_prompt(image_base64)
-        response = self._call_groq_api(
+        response = self._call_together_api(
             self.vision_llm_model,
             prompt,
             temperature=1,
@@ -675,7 +677,7 @@ Format your response as a structured JSON."""
 
     def _run_elements_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._elements_prompt(image_base64)
-        response = self._call_groq_api(
+        response = self._call_together_api(
             self.vision_llm_model,
             prompt,
             temperature=1,
@@ -686,7 +688,7 @@ Format your response as a structured JSON."""
 
     def _run_text_presence_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._text_presence_prompt(image_base64)
-        response = self._call_groq_api(
+        response = self._call_together_api(
             self.vision_llm_model,
             prompt,
             temperature=1,
@@ -697,7 +699,7 @@ Format your response as a structured JSON."""
 
     def _run_theme_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._theme_prompt(image_base64)
-        response = self._call_groq_api(
+        response = self._call_together_api(
             self.vision_llm_model,
             prompt,
             temperature=1,
@@ -708,7 +710,7 @@ Format your response as a structured JSON."""
 
     def _run_cta_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._cta_prompt(image_base64)
-        response = self._call_groq_api(
+        response = self._call_together_api(
             self.vision_llm_model,
             prompt,
             temperature=1,
@@ -719,7 +721,7 @@ Format your response as a structured JSON."""
 
     def _run_character_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._character_prompt(image_base64)
-        response = self._call_groq_api(
+        response = self._call_together_api(
             self.vision_llm_model,
             prompt,
             temperature=1,
@@ -730,7 +732,7 @@ Format your response as a structured JSON."""
 
     def _run_character_role_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._character_role_prompt(image_base64)
-        response = self._call_groq_api(
+        response = self._call_together_api(
             self.vision_llm_model,
             prompt,
             temperature=1,
@@ -741,7 +743,7 @@ Format your response as a structured JSON."""
 
     def _run_context_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._context_prompt(image_base64)
-        response = self._call_groq_api(
+        response = self._call_together_api(
             self.vision_llm_model,
             prompt,
             temperature=1,
@@ -752,7 +754,7 @@ Format your response as a structured JSON."""
 
     def _run_offer_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._offer_prompt(image_base64)
-        response = self._call_groq_api(
+        response = self._call_together_api(
             self.vision_llm_model,
             prompt,
             temperature=1,
@@ -913,7 +915,7 @@ Format your response as a structured JSON."""
                 analyses[image_path] = {"error": str(e)}
 
         comparison_prompt = self._integration_reasoning_prompt(analyses)
-        response = self._call_groq_api(
+        response = self._call_together_api(
             self.reasoning_llm_model,
             comparison_prompt,
             max_tokens=4096,
@@ -954,7 +956,6 @@ Format your response as a structured JSON."""
         cv2.imwrite(output_path, img)
         return output_path
 
-
 # ------------------ FASTAPI APP ------------------
 
 logging.basicConfig(
@@ -984,8 +985,8 @@ os.makedirs("visualizations", exist_ok=True)
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
 
-def get_analyzer(api_key: str = Depends(api_key_header)) -> "EnhancedFinancialImageAnalyzer":
-    # Instantiate analyzer with the provided API key
+def get_analyzer(api_key: str = Depends(api_key_header)) -> EnhancedFinancialImageAnalyzer:
+    together.api_key = api_key
     return EnhancedFinancialImageAnalyzer(
         together_api_key=api_key,
         vision_llm_model="Qwen/Qwen2.5-VL-72B-Instruct",
@@ -1011,7 +1012,7 @@ def read_root():
 @app.post("/analyze-image/")
 async def analyze_image(
     file: UploadFile = File(...),
-    analyzer: "EnhancedFinancialImageAnalyzer" = Depends(get_analyzer)
+    analyzer: EnhancedFinancialImageAnalyzer = Depends(get_analyzer)
 ) -> Dict[str, Any]:
     start_time = time.time()
     if not file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
@@ -1046,7 +1047,7 @@ async def analyze_image(
 async def focused_analyze_image(
     file: UploadFile = File(...),
     categories: str = "Color Palette,Layout & Composition,Object Detection",
-    analyzer: "EnhancedFinancialImageAnalyzer" = Depends(get_analyzer)
+    analyzer: EnhancedFinancialImageAnalyzer = Depends(get_analyzer)
 ) -> Dict[str, Any]:
     start_time = time.time()
     category_list = [cat.strip() for cat in categories.split(",")]
@@ -1082,7 +1083,7 @@ async def focused_analyze_image(
 @app.post("/visualize-detections/")
 async def visualize_detections(
     file: UploadFile = File(...),
-    analyzer: "EnhancedFinancialImageAnalyzer" = Depends(get_analyzer)
+    analyzer: EnhancedFinancialImageAnalyzer = Depends(get_analyzer)
 ) -> Dict[str, Any]:
     if not file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
         raise HTTPException(
@@ -1114,7 +1115,7 @@ async def visualize_detections(
 async def compare_images(
     files: List[UploadFile] = File(...),
     categories: str = None,
-    analyzer: "EnhancedFinancialImageAnalyzer" = Depends(get_analyzer)
+    analyzer: EnhancedFinancialImageAnalyzer = Depends(get_analyzer)
 ) -> Dict[str, Any]:
     if len(files) < 2:
         raise HTTPException(
