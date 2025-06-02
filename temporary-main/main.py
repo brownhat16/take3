@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor
 import re
-
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,9 +21,12 @@ import logging
 from dotenv import load_dotenv
 import ssl
 import certifi
+from groq import Groq
 
 ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
+
 load_dotenv()
+
 
 # ------------------ MODEL & ANALYZER ------------------
 
@@ -114,12 +116,13 @@ class ObjectDetectionModule:
             detr_detections = self.detect_objects_detr(image_path)
             return yolo_detections + detr_detections
 
+
 class EnhancedFinancialImageAnalyzer:
     def __init__(self,
-                 together_api_key: str,
-                 vision_llm_model: str = "Qwen/Qwen2.5-VL-72B-Instruct",
-                 reasoning_llm_model: str = "Qwen/Qwen3-235B-A22B-fp8-tput",
-                 text_llm_model: str = "nim/meta/llama-3.3-70b-instruct",
+                 groq_api_key: str,
+                 vision_llm_model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
+                 reasoning_llm_model: str = "qwen-qwq-32b",
+                 text_llm_model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
                  yolo_model_path: str = "yolov8n.pt",
                  detr_model_name: str = "facebook/detr-resnet-50",
                  use_deyo: bool = False,
@@ -127,7 +130,7 @@ class EnhancedFinancialImageAnalyzer:
                  cache_dir: str = "cache",
                  parallel_execution: bool = True,
                  max_workers: int = 3):
-        self.together_api_key = together_api_key
+        self.groq_api_key = groq_api_key
         self.vision_llm_model = vision_llm_model
         self.reasoning_llm_model = reasoning_llm_model
         self.text_llm_model = text_llm_model
@@ -135,13 +138,19 @@ class EnhancedFinancialImageAnalyzer:
         self.cache_dir = cache_dir
         self.parallel_execution = parallel_execution
         self.max_workers = max_workers
+
+        # Initialize Groq client
+        self.groq_client = Groq(api_key=self.groq_api_key)
+
         if self.use_cache and not os.path.exists(self.cache_dir):
             os.makedirs(self.cache_dir)
+
         self.object_detector = ObjectDetectionModule(
             yolo_model_path=yolo_model_path,
             detr_model_name=detr_model_name,
             use_deyo=use_deyo
         )
+
         self.taxonomy = self._create_taxonomy()
 
     def _create_taxonomy(self) -> Dict[str, List[str]]:
@@ -187,47 +196,43 @@ class EnhancedFinancialImageAnalyzer:
         except Exception:
             pass
 
-    def _call_together_api(self, model: str, messages: List[Dict[str, Any]],
-                           max_tokens: int = 1024, temperature: float = 0.2) -> Dict[str, Any]:
-        headers = {
-            "Authorization": f"Bearer {self.together_api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature
-        }
+    def _call_groq_api(self, model: str, messages: List[Dict[str, Any]],
+                       max_tokens: int = 1024, temperature: float = 0.2, top_p: float = 1.0) -> Dict[str, Any]:
         max_retries = 3
         retry_delay = 2
+
         for attempt in range(max_retries):
             try:
-                response = requests.post(
-                    "https://api.together.xyz/v1/chat/completions",
-                    headers=headers,
-                    json=payload
+                completion = self.groq_client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_completion_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stream=False
                 )
-                if response.status_code == 200:
-                    return response.json()
-                elif response.status_code == 429:
-                    retry_delay = min(retry_delay * 2, 60)
-                    time.sleep(retry_delay)
-                else:
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_delay)
-                    else:
-                        return {"error": f"API error: {response.status_code} - {response.text}"}
+
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": completion.choices[0].message.content
+                        }
+                    }]
+                }
+
             except Exception as e:
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)
                 else:
-                    return {"error": f"Request error: {str(e)}"}
+                    return {"error": f"Groq API error: {str(e)}"}
+
         return {"error": "Max retries exceeded"}
 
     def _extract_json_from_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         if "error" in response:
             return {"error": response["error"]}
+
         try:
             content = response["choices"][0]["message"]["content"]
             try:
@@ -424,22 +429,26 @@ Format your response as a JSON with exactly these keys and values from the optio
         detection_text = ""
         for i, det in enumerate(detections):
             detection_text += f"{i + 1}. Class: {det['class']}, Confidence: {det['confidence']:.2f}, Model: {det['model']}\n"
+
         return [
             {
                 "role": "system",
-                "content": """You are an expert in computer vision and object detection. 
-                Analyze this image and verify the detected objects. For each detection:
-                1. Confirm if the object is actually present
-                2. Verify if the classification is correct
-                3. Suggest any missed objects
-                4. Provide confidence in your assessment (0-1)
+                "content": """You are an expert in computer vision and object detection.
 
-                Format your response as a JSON with these keys:
-                - "verified_detections": List of objects you confirm are present
-                - "corrected_detections": List of objects with corrected classifications
-                - "missed_objects": List of objects that were missed
-                - "confidence": Your overall confidence in this assessment
-                """
+Analyze this image and verify the detected objects. For each detection:
+
+1. Confirm if the object is actually present
+2. Verify if the classification is correct
+3. Suggest any missed objects
+4. Provide confidence in your assessment (0-1)
+
+Format your response as a JSON with these keys:
+- "verified_detections": List of objects you confirm are present
+- "corrected_detections": List of objects with corrected classifications
+- "missed_objects": List of objects that were missed
+- "confidence": Your overall confidence in this assessment
+
+"""
             },
             {
                 "role": "user",
@@ -536,6 +545,7 @@ Format your response as a JSON with exactly these keys and values from the optio
             {
                 "role": "system",
                 "content": """You are an expert financial marketing analyst. Review the provided analysis results and:
+
 1. Identify any inconsistencies or errors
 2. Determine the overall marketing strategy and target audience
 3. Assess the effectiveness of the visual communication
@@ -552,12 +562,20 @@ Format your response as a structured JSON."""
 
     def _run_enhanced_object_detection(self, image_path: str) -> Dict[str, Any]:
         detections = self.object_detector.detect_objects(image_path)
+
         if not detections:
             return self._run_llm_object_detection(self._encode_image(image_path))
+
         image_base64 = self._encode_image(image_path)
         verification_prompt = self._object_verification_prompt(image_base64, detections)
-        verification_response = self._call_together_api(self.vision_llm_model, verification_prompt)
+        verification_response = self._call_groq_api(
+            self.vision_llm_model,
+            verification_prompt,
+            temperature=1,
+            top_p=1.0
+        )
         verification_result = self._extract_json_from_response(verification_response)
+
         verified_objects = []
         if "verified_detections" in verification_result:
             verified_objects.extend(verification_result["verified_detections"])
@@ -565,15 +583,19 @@ Format your response as a structured JSON."""
             verified_objects.extend(verification_result["corrected_detections"])
         if "missed_objects" in verification_result:
             verified_objects.extend(verification_result["missed_objects"])
+
         if not verified_objects and detections:
             verified_objects = [det["class"] for det in detections]
+
         objects_str = ", ".join(set(
             obj if isinstance(obj, str) else str(obj)
             for obj in verified_objects
         )) if verified_objects else "None"
+
         has_logo = any("logo" in det["class"].lower() for det in detections)
         if not has_logo and "brand logo" in str(verification_result).lower():
             has_logo = True
+
         logo_size = "None"
         if has_logo:
             logo_detections = [det for det in detections if "logo" in det["class"].lower()]
@@ -586,6 +608,7 @@ Format your response as a structured JSON."""
                 )
                 logo_area = (logo_det["box"][2] - logo_det["box"][0]) * (logo_det["box"][3] - logo_det["box"][1])
                 logo_ratio = logo_area / img_area
+
                 if logo_ratio < 0.05:
                     logo_size = "Small"
                 elif logo_ratio < 0.15:
@@ -594,99 +617,224 @@ Format your response as a structured JSON."""
                     logo_size = "Large"
             else:
                 logo_size = "Small"
+
         result = {
             "Objects visible": objects_str,
             "Brand logo visible": "Yes" if has_logo else "No",
             "Brand logo size": logo_size,
         }
+
         confidence = verification_result.get("confidence", 0.95)
         return self._add_confidence_scores(result, confidence)
 
     def _run_llm_object_detection(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._object_detection_prompt(image_base64)
-        response = self._call_together_api(self.vision_llm_model, prompt)
+        response = self._call_groq_api(
+            self.vision_llm_model,
+            prompt,
+            temperature=1,
+            top_p=1.0
+        )
         result = self._extract_json_from_response(response)
         return self._add_confidence_scores(result, 0.85)
 
     def _run_color_palette_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._color_palette_prompt(image_base64)
-        response = self._call_together_api(self.vision_llm_model, prompt)
+        response = self._call_groq_api(
+            self.vision_llm_model,
+            prompt,
+            temperature=1,
+            top_p=1.0
+        )
         result = self._extract_json_from_response(response)
         return self._add_confidence_scores(result, 0.9)
 
     def _run_layout_composition_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._layout_composition_prompt(image_base64)
-        response = self._call_together_api(self.vision_llm_model, prompt)
+        response = self._call_groq_api(
+            self.vision_llm_model,
+            prompt,
+            temperature=1,
+            top_p=1.0
+        )
         result = self._extract_json_from_response(response)
         return self._add_confidence_scores(result, 0.85)
 
     def _run_image_type_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._image_type_prompt(image_base64)
-        response = self._call_together_api(self.vision_llm_model, prompt)
+        response = self._call_groq_api(
+            self.vision_llm_model,
+            prompt,
+            temperature=1,
+            top_p=1.0
+        )
         result = self._extract_json_from_response(response)
         return self._add_confidence_scores(result, 0.9)
 
     def _run_elements_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._elements_prompt(image_base64)
-        response = self._call_together_api(self.vision_llm_model, prompt)
+        response = self._call_groq_api(
+            self.vision_llm_model,
+            prompt,
+            temperature=1,
+            top_p=1.0
+        )
         result = self._extract_json_from_response(response)
         return self._add_confidence_scores(result, 0.85)
 
     def _run_text_presence_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._text_presence_prompt(image_base64)
-        response = self._call_together_api(self.vision_llm_model, prompt)
+        response = self._call_groq_api(
+            self.vision_llm_model,
+            prompt,
+            temperature=1,
+            top_p=1.0
+        )
         result = self._extract_json_from_response(response)
         return self._add_confidence_scores(result, 0.9)
 
     def _run_theme_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._theme_prompt(image_base64)
-        response = self._call_together_api(self.vision_llm_model, prompt)
+        response = self._call_groq_api(
+            self.vision_llm_model,
+            prompt,
+            temperature=1,
+            top_p=1.0
+        )
         result = self._extract_json_from_response(response)
         return self._add_confidence_scores(result, 0.8)
 
     def _run_cta_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._cta_prompt(image_base64)
-        response = self._call_together_api(self.vision_llm_model, prompt)
+        response = self._call_groq_api(
+            self.vision_llm_model,
+            prompt,
+            temperature=1,
+            top_p=1.0
+        )
         result = self._extract_json_from_response(response)
         return self._add_confidence_scores(result, 0.9)
 
     def _run_character_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._character_prompt(image_base64)
-        response = self._call_together_api(self.vision_llm_model, prompt)
+        response = self._call_groq_api(
+            self.vision_llm_model,
+            prompt,
+            temperature=1,
+            top_p=1.0
+        )
         result = self._extract_json_from_response(response)
         return self._add_confidence_scores(result, 0.85)
 
     def _run_character_role_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._character_role_prompt(image_base64)
-        response = self._call_together_api(self.vision_llm_model, prompt)
+        response = self._call_groq_api(
+            self.vision_llm_model,
+            prompt,
+            temperature=1,
+            top_p=1.0
+        )
         result = self._extract_json_from_response(response)
         return self._add_confidence_scores(result, 0.8)
 
     def _run_context_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._context_prompt(image_base64)
-        response = self._call_together_api(self.vision_llm_model, prompt)
+        response = self._call_groq_api(
+            self.vision_llm_model,
+            prompt,
+            temperature=1,
+            top_p=1.0
+        )
         result = self._extract_json_from_response(response)
         return self._add_confidence_scores(result, 0.85)
 
     def _run_offer_analysis(self, image_base64: str) -> Dict[str, Any]:
         prompt = self._offer_prompt(image_base64)
-        response = self._call_together_api(self.vision_llm_model, prompt)
+        response = self._call_groq_api(
+            self.vision_llm_model,
+            prompt,
+            temperature=1,
+            top_p=1.0
+        )
         result = self._extract_json_from_response(response)
         return self._add_confidence_scores(result, 0.9)
 
     def _get_default_values_for_category(self, category: str) -> Dict[str, Any]:
-        # (Default values as in your original code)
-        # ... (omitted for brevity, see paste.txt for full dictionary)
-        return {}
+        defaults = {
+            "Color Palette": {
+                "Dominant colors": "Unknown",
+                "Brightness": "Unknown",
+                "Warm vs cool tones": "Unknown",
+                "Contrast level": "Unknown"
+            },
+            "Layout & Composition": {
+                "Text-to-image ratio": "Unknown",
+                "Left vs right alignment": "Unknown",
+                "Symmetry": "Unknown",
+                "Whitespace usage": "Unknown"
+            },
+            "Image Type": {
+                "Image focus type": "Unknown",
+                "Visual format": "Unknown",
+                "Illustration vs photo": "Unknown"
+            },
+            "Elements": {
+                "Number of products shown": "Unknown",
+                "Number of people shown": "Unknown",
+                "Design density": "Unknown"
+            },
+            "Presence of Text": {
+                "Embedded text present": "Unknown",
+                "Text language": "Unknown",
+                "Font style": "Unknown"
+            },
+            "Theme": {
+                "Festival/special occasion logo": "Unknown",
+                "Festival name": "Unknown",
+                "Logo size": "Unknown",
+                "Logo placement": "Unknown"
+            },
+            "CTA": {
+                "Call-to-action button present": "Unknown",
+                "CTA placement": "Unknown",
+                "CTA contrast": "Unknown"
+            },
+            "Object Detection": {
+                "Objects visible": "Unknown",
+                "Brand logo visible": "Unknown",
+                "Brand logo size": "Unknown"
+            },
+            "Character": {
+                "Emotion (if faces shown)": "Unknown",
+                "Gender shown (if people shown)": "Unknown"
+            },
+            "Character Role": {
+                "Employment type (if shown)": "Unknown"
+            },
+            "Context": {
+                "Environment type": "Unknown",
+                "Location hints": "Unknown"
+            },
+            "Offer": {
+                "Offer text present": "Unknown",
+                "Offer type": "Unknown",
+                "Offer text size": "Unknown",
+                "Offer text position": "Unknown"
+            }
+        }
+        return defaults.get(category, {})
 
     def analyze_image(self, image_path: str, categories: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
         image_base64 = self._encode_image(image_path)
         all_categories = list(self.taxonomy.keys())
         categories_to_analyze = categories if categories is not None else all_categories
+
         analysis_results = {}
+
         if self.parallel_execution:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = {}
+
                 for category in categories_to_analyze:
                     if category == "Color Palette":
                         futures[category] = executor.submit(self._run_color_palette_analysis, image_base64)
@@ -712,6 +860,7 @@ Format your response as a structured JSON."""
                         futures[category] = executor.submit(self._run_context_analysis, image_base64)
                     elif category == "Offer":
                         futures[category] = executor.submit(self._run_offer_analysis, image_base64)
+
                 for category, future in futures.items():
                     try:
                         analysis_results[category] = future.result()
@@ -746,9 +895,11 @@ Format your response as a structured JSON."""
                         analysis_results[category] = self._run_offer_analysis(image_base64)
                 except Exception:
                     analysis_results[category] = self._get_default_values_for_category(category)
+
         for category in categories_to_analyze:
             if category not in analysis_results:
                 analysis_results[category] = self._get_default_values_for_category(category)
+
         return analysis_results
 
     def compare_images(self, image_paths: List[str], categories: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -758,9 +909,17 @@ Format your response as a structured JSON."""
                 analyses[image_path] = self.analyze_image(image_path, categories)
             except Exception as e:
                 analyses[image_path] = {"error": str(e)}
+
         comparison_prompt = self._integration_reasoning_prompt(analyses)
-        response = self._call_together_api(self.reasoning_llm_model, comparison_prompt, max_tokens=2048)
+        response = self._call_groq_api(
+            self.reasoning_llm_model,
+            comparison_prompt,
+            max_tokens=4096,
+            temperature=0.6,
+            top_p=0.95
+        )
         comparison = self._extract_json_from_response(response)
+
         return {
             "individual_analyses": analyses,
             "comparison": comparison
@@ -770,23 +929,29 @@ Format your response as a structured JSON."""
         if output_path is None:
             base_name = os.path.splitext(image_path)[0]
             output_path = f"{base_name}_detected.jpg"
+
         detections = self.object_detector.detect_objects(image_path)
         img = cv2.imread(image_path)
+
         for det in detections:
             x1, y1, x2, y2 = [int(coord) for coord in det["box"]]
             class_name = det["class"]
             confidence = det["confidence"]
             model_name = det["model"]
+
             color = (0, 255, 0)
             if model_name == "detr":
                 color = (255, 0, 0)
             elif model_name == "deyo":
                 color = (0, 0, 255)
+
             cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
             label = f"{class_name} ({confidence:.2f})"
             cv2.putText(img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
         cv2.imwrite(output_path, img)
         return output_path
+
 
 # ------------------ FASTAPI APP ------------------
 
@@ -794,12 +959,13 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
+
 logger = logging.getLogger("financial-image-analyzer")
 
 app = FastAPI(
     title="Enhanced Financial Image Analyzer API",
-    description="API for analyzing financial marketing images with YOLO, DETR object detection and LLM analysis",
-    version="1.1.0"
+    description="API for analyzing financial marketing images with YOLO, DETR object detection and Groq LLM analysis",
+    version="1.2.0"
 )
 
 app.add_middleware(
@@ -813,13 +979,13 @@ app.add_middleware(
 os.makedirs("temp_uploads", exist_ok=True)
 os.makedirs("visualizations", exist_ok=True)
 
-TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "7100eda583c8df104e8868de85a08fd5e98b803261901aee01fa0fbf9e4eab94")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")
 
 analyzer = EnhancedFinancialImageAnalyzer(
-    together_api_key=TOGETHER_API_KEY,
-    vision_llm_model="Qwen/Qwen2.5-VL-72B-Instruct",
-    reasoning_llm_model="Qwen/Qwen3-235B-A22B-fp8-tput",
-    text_llm_model="meta-llama/Meta-Llama-Guard-3-8B",
+    groq_api_key="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",
+    vision_llm_model="meta-llama/llama-4-scout-17b-16e-instruct",
+    reasoning_llm_model="qwen-qwq-32b",
+    text_llm_model="meta-llama/llama-4-scout-17b-16e-instruct",
     yolo_model_path="yolov8n.pt",
     detr_model_name="facebook/detr-resnet-50",
     use_deyo=False,
@@ -829,12 +995,13 @@ analyzer = EnhancedFinancialImageAnalyzer(
     max_workers=3
 )
 
+
 @app.get("/")
 def read_root():
     return {
         "status": "ok",
-        "message": "Enhanced Financial Image Analyzer API is ready",
-        "version": "1.1.0",
+        "message": "Enhanced Financial Image Analyzer API with Groq is ready",
+        "version": "1.2.0",
         "models": {
             "vision_llm": analyzer.vision_llm_model,
             "reasoning_llm": analyzer.reasoning_llm_model,
@@ -843,36 +1010,47 @@ def read_root():
         }
     }
 
+
 @app.post("/analyze-image/")
 async def analyze_image(file: UploadFile = File(...)) -> Dict[str, Any]:
     start_time = time.time()
+
     if not file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
         raise HTTPException(
             status_code=400,
             detail="Invalid file format. Please upload a JPG, PNG, or BMP image."
         )
+
     temp_file_path = f"temp_uploads/temp_{int(time.time())}_{file.filename}"
+
     try:
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+
         logger.info(f"Processing image: {file.filename}")
         full_results = analyzer.analyze_image(temp_file_path)
+
         tags_only_results = {}
         for category, values in full_results.items():
             tags_only_results[category] = {k: v for k, v in values.items() if not k.endswith("_confidence")}
+
         processing_time = time.time() - start_time
         logger.info(f"Image processed in {processing_time:.2f} seconds")
+
         return JSONResponse(content={
             "results": tags_only_results,
             "filename": file.filename,
             "processing_time_seconds": round(processing_time, 2)
         })
+
     except Exception as e:
         logger.error(f"Error processing image {file.filename}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
+
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
+
 
 @app.post("/analyze-image/focused/")
 async def focused_analyze_image(
@@ -881,34 +1059,44 @@ async def focused_analyze_image(
 ) -> Dict[str, Any]:
     start_time = time.time()
     category_list = [cat.strip() for cat in categories.split(",")]
+
     if not file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
         raise HTTPException(
             status_code=400,
             detail="Invalid file format. Please upload a JPG, PNG, or BMP image."
         )
+
     temp_file_path = f"temp_uploads/temp_{int(time.time())}_{file.filename}"
+
     try:
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+
         logger.info(f"Processing image with focus on: {categories}")
         focused_results = analyzer.analyze_image(temp_file_path, categories=category_list)
+
         tags_only_results = {}
         for category, values in focused_results.items():
             tags_only_results[category] = {k: v for k, v in values.items() if not k.endswith("_confidence")}
+
         processing_time = time.time() - start_time
         logger.info(f"Focused analysis completed in {processing_time:.2f} seconds")
+
         return JSONResponse(content={
             "results": tags_only_results,
             "filename": file.filename,
             "categories_analyzed": category_list,
             "processing_time_seconds": round(processing_time, 2)
         })
+
     except Exception as e:
         logger.error(f"Error in focused analysis of {file.filename}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
+
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
+
 
 @app.post("/visualize-detections/")
 async def visualize_detections(file: UploadFile = File(...)) -> Dict[str, Any]:
@@ -917,26 +1105,33 @@ async def visualize_detections(file: UploadFile = File(...)) -> Dict[str, Any]:
             status_code=400,
             detail="Invalid file format. Please upload a JPG, PNG, or BMP image."
         )
+
     timestamp = int(time.time())
     temp_file_path = f"temp_uploads/temp_{timestamp}_{file.filename}"
     output_filename = f"detected_{timestamp}_{file.filename}"
     output_path = f"visualizations/{output_filename}"
+
     try:
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+
         logger.info(f"Visualizing detections for: {file.filename}")
         visualization_path = analyzer.visualize_detections(temp_file_path, output_path)
         visualization_url = f"/visualizations/{os.path.basename(visualization_path)}"
+
         return JSONResponse(content={
             "filename": file.filename,
             "visualization_path": visualization_url
         })
+
     except Exception as e:
         logger.error(f"Error visualizing detections for {file.filename}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error visualizing detections: {str(e)}")
+
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
+
 
 @app.post("/compare-images/")
 async def compare_images(files: List[UploadFile] = File(...), categories: str = None) -> Dict[str, Any]:
@@ -945,10 +1140,13 @@ async def compare_images(files: List[UploadFile] = File(...), categories: str = 
             status_code=400,
             detail="Please upload at least two images to compare"
         )
+
     category_list = None
     if categories:
         category_list = [cat.strip() for cat in categories.split(",")]
+
     temp_file_paths = []
+
     try:
         for file in files:
             if not file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
@@ -956,12 +1154,15 @@ async def compare_images(files: List[UploadFile] = File(...), categories: str = 
                     status_code=400,
                     detail=f"Invalid file format for {file.filename}. Please upload only image files."
                 )
+
             temp_path = f"temp_uploads/temp_{int(time.time())}_{file.filename}"
             with open(temp_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
             temp_file_paths.append(temp_path)
+
         logger.info(f"Comparing {len(files)} images")
         comparison_results = analyzer.compare_images(temp_file_paths, categories=category_list)
+
         filtered_analyses = {}
         for path, analysis in comparison_results["individual_analyses"].items():
             filename = os.path.basename(path)
@@ -973,20 +1174,25 @@ async def compare_images(files: List[UploadFile] = File(...), categories: str = 
                     }
                 else:
                     filtered_analyses[filename][category] = values
+
         return JSONResponse(content={
             "individual_analyses": filtered_analyses,
             "comparison": comparison_results["comparison"],
             "filenames": [file.filename for file in files]
         })
+
     except Exception as e:
         logger.error(f"Error comparing images: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error comparing images: {str(e)}")
+
     finally:
         for path in temp_file_paths:
             if os.path.exists(path):
                 os.remove(path)
 
+
 if __name__ == "__main__":
     import uvicorn
+
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
