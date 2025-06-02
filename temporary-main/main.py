@@ -22,6 +22,8 @@ from dotenv import load_dotenv
 import ssl
 import certifi
 from groq import Groq
+from fastapi import Depends, HTTPException, status
+from fastapi.security import APIKeyHeader
 
 ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
 
@@ -959,13 +961,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-
 logger = logging.getLogger("financial-image-analyzer")
 
 app = FastAPI(
     title="Enhanced Financial Image Analyzer API",
-    description="API for analyzing financial marketing images with YOLO, DETR object detection and Groq LLM analysis",
-    version="1.2.0"
+    description="API for analyzing financial marketing images with YOLO, DETR object detection and LLM analysis",
+    version="1.1.0"
 )
 
 app.add_middleware(
@@ -979,174 +980,151 @@ app.add_middleware(
 os.makedirs("temp_uploads", exist_ok=True)
 os.makedirs("visualizations", exist_ok=True)
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")
+# --------- API Key Dependency ---------
 
-analyzer = EnhancedFinancialImageAnalyzer(
-    groq_api_key="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",
-    vision_llm_model="meta-llama/llama-4-scout-17b-16e-instruct",
-    reasoning_llm_model="qwen-qwq-32b",
-    text_llm_model="meta-llama/llama-4-scout-17b-16e-instruct",
-    yolo_model_path="yolov8n.pt",
-    detr_model_name="facebook/detr-resnet-50",
-    use_deyo=False,
-    use_cache=True,
-    cache_dir="cache",
-    parallel_execution=True,
-    max_workers=3
-)
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
 
+def get_analyzer(api_key: str = Depends(api_key_header)) -> "EnhancedFinancialImageAnalyzer":
+    # Instantiate analyzer with the provided API key
+    return EnhancedFinancialImageAnalyzer(
+        together_api_key=api_key,
+        vision_llm_model="Qwen/Qwen2.5-VL-72B-Instruct",
+        reasoning_llm_model="Qwen/Qwen3-235B-A22B-fp8-tput",
+        text_llm_model="meta-llama/Meta-Llama-Guard-3-8B",
+        yolo_model_path="yolov8n.pt",
+        detr_model_name="facebook/detr-resnet-50",
+        use_deyo=False,
+        use_cache=True,
+        cache_dir="cache",
+        parallel_execution=True,
+        max_workers=3
+    )
 
 @app.get("/")
 def read_root():
     return {
         "status": "ok",
-        "message": "Enhanced Financial Image Analyzer API with Groq is ready",
-        "version": "1.2.0",
-        "models": {
-            "vision_llm": analyzer.vision_llm_model,
-            "reasoning_llm": analyzer.reasoning_llm_model,
-            "yolo": analyzer.object_detector.yolo_model_path,
-            "detr": analyzer.object_detector.detr_model_name
-        }
+        "message": "Enhanced Financial Image Analyzer API is ready",
+        "version": "1.1.0"
     }
 
-
 @app.post("/analyze-image/")
-async def analyze_image(file: UploadFile = File(...)) -> Dict[str, Any]:
+async def analyze_image(
+    file: UploadFile = File(...),
+    analyzer: "EnhancedFinancialImageAnalyzer" = Depends(get_analyzer)
+) -> Dict[str, Any]:
     start_time = time.time()
-
     if not file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
         raise HTTPException(
             status_code=400,
             detail="Invalid file format. Please upload a JPG, PNG, or BMP image."
         )
-
     temp_file_path = f"temp_uploads/temp_{int(time.time())}_{file.filename}"
-
     try:
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-
         logger.info(f"Processing image: {file.filename}")
         full_results = analyzer.analyze_image(temp_file_path)
-
         tags_only_results = {}
         for category, values in full_results.items():
             tags_only_results[category] = {k: v for k, v in values.items() if not k.endswith("_confidence")}
-
         processing_time = time.time() - start_time
         logger.info(f"Image processed in {processing_time:.2f} seconds")
-
         return JSONResponse(content={
             "results": tags_only_results,
             "filename": file.filename,
             "processing_time_seconds": round(processing_time, 2)
         })
-
     except Exception as e:
         logger.error(f"Error processing image {file.filename}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
-
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
-
 @app.post("/analyze-image/focused/")
 async def focused_analyze_image(
-        file: UploadFile = File(...),
-        categories: str = "Color Palette,Layout & Composition,Object Detection"
+    file: UploadFile = File(...),
+    categories: str = "Color Palette,Layout & Composition,Object Detection",
+    analyzer: "EnhancedFinancialImageAnalyzer" = Depends(get_analyzer)
 ) -> Dict[str, Any]:
     start_time = time.time()
     category_list = [cat.strip() for cat in categories.split(",")]
-
     if not file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
         raise HTTPException(
             status_code=400,
             detail="Invalid file format. Please upload a JPG, PNG, or BMP image."
         )
-
     temp_file_path = f"temp_uploads/temp_{int(time.time())}_{file.filename}"
-
     try:
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-
         logger.info(f"Processing image with focus on: {categories}")
         focused_results = analyzer.analyze_image(temp_file_path, categories=category_list)
-
         tags_only_results = {}
         for category, values in focused_results.items():
             tags_only_results[category] = {k: v for k, v in values.items() if not k.endswith("_confidence")}
-
         processing_time = time.time() - start_time
         logger.info(f"Focused analysis completed in {processing_time:.2f} seconds")
-
         return JSONResponse(content={
             "results": tags_only_results,
             "filename": file.filename,
             "categories_analyzed": category_list,
             "processing_time_seconds": round(processing_time, 2)
         })
-
     except Exception as e:
         logger.error(f"Error in focused analysis of {file.filename}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
-
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
-
 @app.post("/visualize-detections/")
-async def visualize_detections(file: UploadFile = File(...)) -> Dict[str, Any]:
+async def visualize_detections(
+    file: UploadFile = File(...),
+    analyzer: "EnhancedFinancialImageAnalyzer" = Depends(get_analyzer)
+) -> Dict[str, Any]:
     if not file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
         raise HTTPException(
             status_code=400,
             detail="Invalid file format. Please upload a JPG, PNG, or BMP image."
         )
-
     timestamp = int(time.time())
     temp_file_path = f"temp_uploads/temp_{timestamp}_{file.filename}"
     output_filename = f"detected_{timestamp}_{file.filename}"
     output_path = f"visualizations/{output_filename}"
-
     try:
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-
         logger.info(f"Visualizing detections for: {file.filename}")
         visualization_path = analyzer.visualize_detections(temp_file_path, output_path)
         visualization_url = f"/visualizations/{os.path.basename(visualization_path)}"
-
         return JSONResponse(content={
             "filename": file.filename,
             "visualization_path": visualization_url
         })
-
     except Exception as e:
         logger.error(f"Error visualizing detections for {file.filename}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error visualizing detections: {str(e)}")
-
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
-
 @app.post("/compare-images/")
-async def compare_images(files: List[UploadFile] = File(...), categories: str = None) -> Dict[str, Any]:
+async def compare_images(
+    files: List[UploadFile] = File(...),
+    categories: str = None,
+    analyzer: "EnhancedFinancialImageAnalyzer" = Depends(get_analyzer)
+) -> Dict[str, Any]:
     if len(files) < 2:
         raise HTTPException(
             status_code=400,
             detail="Please upload at least two images to compare"
         )
-
     category_list = None
     if categories:
         category_list = [cat.strip() for cat in categories.split(",")]
-
     temp_file_paths = []
-
     try:
         for file in files:
             if not file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
@@ -1154,15 +1132,12 @@ async def compare_images(files: List[UploadFile] = File(...), categories: str = 
                     status_code=400,
                     detail=f"Invalid file format for {file.filename}. Please upload only image files."
                 )
-
             temp_path = f"temp_uploads/temp_{int(time.time())}_{file.filename}"
             with open(temp_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
             temp_file_paths.append(temp_path)
-
         logger.info(f"Comparing {len(files)} images")
         comparison_results = analyzer.compare_images(temp_file_paths, categories=category_list)
-
         filtered_analyses = {}
         for path, analysis in comparison_results["individual_analyses"].items():
             filename = os.path.basename(path)
@@ -1174,25 +1149,20 @@ async def compare_images(files: List[UploadFile] = File(...), categories: str = 
                     }
                 else:
                     filtered_analyses[filename][category] = values
-
         return JSONResponse(content={
             "individual_analyses": filtered_analyses,
             "comparison": comparison_results["comparison"],
             "filenames": [file.filename for file in files]
         })
-
     except Exception as e:
         logger.error(f"Error comparing images: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error comparing images: {str(e)}")
-
     finally:
         for path in temp_file_paths:
             if os.path.exists(path):
                 os.remove(path)
 
-
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
